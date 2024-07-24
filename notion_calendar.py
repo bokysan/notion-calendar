@@ -242,7 +242,7 @@ def get_calendar(notion_database_id: str) -> str:
 
         try:
             if page_prop is not None and page_prop["url"] is not None:
-                e.description = page_prop["url"] + "\r\n"
+                e.description = page_prop["url"] + '\r\n'
             else:
                 e.description = ""
         except TypeError:
