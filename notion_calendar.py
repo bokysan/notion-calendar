@@ -82,6 +82,14 @@ def validate_token(token: typing.Optional[str]):
         raise Unauthorized()
 
 
+@retry(Exception, tries=5, delay=1)
+def get_page(url: str, page_count: int, body: typing.Optional[typing.Dict] = None, headers: typing.Optional[typing.Dict] = None) -> typing.Optional[typing.Dict]:
+    logger.info(f'Fetching {url}, page {page_count}')
+    query_response = requests.post(url, json=body, headers=headers)
+    query_response.raise_for_status()
+    return query_response.json()
+
+
 @retry(Exception, tries=5, delay=0)
 @cachetools.func.ttl_cache(maxsize=128, ttl=600)
 def get_events(notion_database_id: str) -> typing.Dict:
@@ -102,30 +110,20 @@ def get_events(notion_database_id: str) -> typing.Dict:
     }
 
     params = {}
-    pages_and_databases = {}
+    pages_and_databases = []
 
     logger.info(f'Fetching {database_info}')
     info_response = requests.get(database_info, json=params, headers=headers)
     info_response.raise_for_status()
 
     page_count = 1
-    logger.info(f'Fetching {database_query}, page {page_count}')
-    query_response = requests.post(database_query, json=params, headers=headers)
-    query_response.raise_for_status()
-
-    if query_response.ok:
-        search_response_obj = query_response.json()
-        pages_and_databases = search_response_obj.get("results")
-
-        while search_response_obj.get("has_more"):
-            page_count += 1
-            logger.info(f'Fetching {database_query}, page {page_count}')
-            params["start_cursor"] = search_response_obj.get("next_cursor")
-
-            query_response = requests.post(database_query, json=params, headers=headers)
-            if query_response.ok:
-                search_response_obj = query_response.json()
-                pages_and_databases.extend(search_response_obj.get("results"))
+    while True:
+        search_response_obj = get_page(database_query, page_count, params, headers)
+        pages_and_databases.extend(search_response_obj.get("results"))
+        if not search_response_obj.get("has_more"):
+            break
+        page_count += 1
+        params["start_cursor"] = search_response_obj.get("next_cursor")
 
     return {
         'info': info_response.json(),
@@ -153,8 +151,6 @@ def get_calendar(notion_database_id: str) -> str:
 
     for obj in results:
         # Skip archived and trashed objects
-        if obj["archived"] or obj["in_trash"]:
-            continue
 
         # Fetch a few properties into variables
         properties = obj["properties"]
@@ -165,16 +161,24 @@ def get_calendar(notion_database_id: str) -> str:
         date_prop = properties["Date"]
         page_prop = properties["Page"]
 
-        if date_prop["date"] is None:
-            continue
-
-        if date_prop["date"]["start"] is None:
-            continue
-
         try:
             if title_prop is None:
                 continue
         except IndexError:
+            continue
+
+        if len(title_prop["title"]) == 0:
+            continue
+
+        title_0 = title_prop["title"][0]
+
+        if obj["archived"] or obj["in_trash"]:
+            continue
+
+        if date_prop["date"] is None:
+            continue
+
+        if date_prop["date"]["start"] is None:
             continue
 
         try:
@@ -189,80 +193,84 @@ def get_calendar(notion_database_id: str) -> str:
         except IndexError:
             location_prop = None
 
-        if len(title_prop["title"]) > 0:
-            title_0 = title_prop["title"][0]
+        e = Event()
+        e.Meta.serializer = CustomEventSerializer
+        if type_prop["select"] is not None and type_prop["select"]["name"] is not None:
+            e.name = "[" + type_prop["select"]["name"].strip() + "] "
+            e.categories = [
+                type_prop["select"]["name"].strip()
+            ]
+            if type_prop["select"]["color"]:
+                e.color = type_prop["select"]["color"]
+        else:
+            e.name = ""
+            e.categories = []
 
-            e = Event()
-            e.Meta.serializer = CustomEventSerializer
-            if type_prop["select"] is not None and type_prop["select"]["name"] is not None:
-                e.name = "[" + type_prop["select"]["name"].strip() + "] "
-                e.categories = [
-                    type_prop["select"]["name"].strip()
-                ]
-                if type_prop["select"]["color"]:
-                    e.color = type_prop["select"]["color"]
-            else:
-                e.name = ""
-                e.categories = []
+        if obj["icon"] is not None and "emoji" in obj["icon"] and obj["icon"]["emoji"] is not None:
+            e.name = e.name + obj["icon"]["emoji"] + " "
 
-            if obj["icon"] is not None and "emoji" in obj["icon"] and obj["icon"]["emoji"] is not None:
-                e.name = e.name + obj["icon"]["emoji"] + " "
+        e.name = e.name + title_0["plain_text"].strip()
 
-            e.name = e.name + title_0["text"]["content"].strip()
+        for tag in tags_prop["multi_select"]:
+            e.categories = e.categories + [tag["name"]]
 
-            for tag in tags_prop["multi_select"]:
-                e.categories = e.categories + [tag["name"]]
-
-            e.uid = obj["id"]
-            e.url = obj["url"]
-            if date_prop["date"] is not None:
+        e.uid = obj["id"]
+        e.url = obj["url"]
+        if date_prop["date"] is not None:
+            if date_prop["date"]["start"] is not None:
                 is_all_day = False
-                if date_prop["date"]["start"] is not None:
-                    try:
-                        if len(date_prop["date"]["start"]) == 10:
-                            is_all_day = True
+                try:
+                    if len(date_prop["date"]["start"]) == 10:
+                        is_all_day = True
+                        e.begin = arrow.get(date_prop["date"]["start"]).floor('day')
+                    else:
                         e.begin = arrow.get(date_prop["date"]["start"], tzinfo=ljubljana)
-                    except arrow.ParserError:
-                        e.begin = arrow.get(date_prop["date"]["start"])
-                if date_prop["date"]["end"] is not None:
-                    try:
-                        e.end = arrow.get(date_prop["date"]["end"], tzinfo=ljubljana)
-                    except arrow.ParserError:
-                        e.end = arrow.get(date_prop["date"]["end"])
-                else:
-                    e.end = e.begin
-
+                except arrow.ParserError:
+                    e.begin = arrow.get(date_prop["date"]["start"])
                 if is_all_day:
                     e.make_all_day()
-            try:
-                if page_prop is not None and page_prop["url"] is not None:
-                    e.description = page_prop["url"] + "\r\n"
-                else:
-                    e.description = ""
-            except TypeError:
+            if date_prop["date"]["end"] is not None:
+                try:
+                    if len(date_prop["date"]["end"]) == 10:
+                        e.end = arrow.get(date_prop["date"]["end"]).floor('day')
+                    else:
+                        e.end = arrow.get(date_prop["date"]["end"], tzinfo=ljubljana)
+                except arrow.ParserError:
+                    e.end = arrow.get(date_prop["date"]["end"])
+            else:
+                e.end = e.begin
+
+        try:
+            if page_prop is not None and page_prop["url"] is not None:
+                e.description = page_prop["url"] + "\r\n"
+            else:
                 e.description = ""
+        except TypeError:
+            e.description = ""
 
-            if properties["Status"] and properties["Status"]["status"] and properties["Status"]["status"]["name"]:
-                status = properties["Status"]["status"]["name"]
-                if status == "Not going":
-                    e.status = "CANCELLED"
-                elif status == "Confirmed":
-                    e.status = "CONFIRMED"
-                elif status == "Need more info":
-                    e.status = "TENTATIVE"
+        if properties["Status"] and properties["Status"]["status"] and properties["Status"]["status"]["name"]:
+            status = properties["Status"]["status"]["name"]
+            if status == "Not going":
+                e.status = "CANCELLED"
+            elif status == "Confirmed":
+                e.status = "CONFIRMED"
+            elif status == "Need more info":
+                e.status = "TENTATIVE"
 
-            # TENTATIVE, CONFIRMED, CANCELLED
-            # e.status =
-            if obj["created_time"] is not None:
-                e.created = arrow.get(obj["created_time"])
-            if obj["last_edited_time"] is not None:
-                e.last_modified = arrow.get(obj["last_edited_time"])
-            if location_prop is not None and len(location_prop["rich_text"]) > 0:
-                e.location = location_prop["rich_text"][0]["plain_text"].strip()
-            c.events.add(e)
+        # TENTATIVE, CONFIRMED, CANCELLED
+        # e.status =
+        if obj["created_time"] is not None:
+            e.created = arrow.get(obj["created_time"])
+        if obj["last_edited_time"] is not None:
+            e.last_modified = arrow.get(obj["last_edited_time"])
+        if location_prop is not None and len(location_prop["rich_text"]) > 0:
+            e.location = location_prop["rich_text"][0]["plain_text"].strip()
+        c.events.add(e)
 
     logger.info(f'Done for {notion_database_id}...')
-    return ''.join(c.serialize_iter())
+    result = ''.join(c.serialize_iter())
+
+    return result
 
 
 #                                                     notion_view_id = vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
