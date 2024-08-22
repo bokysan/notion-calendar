@@ -217,8 +217,8 @@ def get_calendar(notion_database_id: str) -> str:
         e.uid = obj["id"]
         e.url = obj["url"]
         if date_prop["date"] is not None:
+            is_all_day = False
             if date_prop["date"]["start"] is not None:
-                is_all_day = False
                 try:
                     if len(date_prop["date"]["start"]) == 10:
                         is_all_day = True
@@ -229,16 +229,22 @@ def get_calendar(notion_database_id: str) -> str:
                     e.begin = arrow.get(date_prop["date"]["start"])
                 if is_all_day:
                     e.make_all_day()
+
             if date_prop["date"]["end"] is not None:
-                try:
-                    if len(date_prop["date"]["end"]) == 10:
-                        e.end = arrow.get(date_prop["date"]["end"]).floor('day')
-                    else:
+                # End days, by iCal definition are EXCLUSIVE. So if the event is a whole day event,
+                # we must define it as ending one day later.
+                if len(date_prop["date"]["end"]) == 10:
+                    e.end = arrow.get(date_prop["date"]["end"]).floor('day').shift(days=+1)
+                else:
+                    try:
                         e.end = arrow.get(date_prop["date"]["end"], tzinfo=ljubljana)
-                except arrow.ParserError:
-                    e.end = arrow.get(date_prop["date"]["end"])
+                    except arrow.ParserError:
+                        e.end = arrow.get(date_prop["date"]["end"])
             else:
-                e.end = e.begin
+                if is_all_day:
+                    e.end = e.begin.shift(days=+1)
+                else:
+                    e.end = e.begin
 
         try:
             if page_prop is not None and page_prop["url"] is not None:
